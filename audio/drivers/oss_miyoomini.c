@@ -13,25 +13,28 @@
  *  You should have received a copy of the GNU General Public License along with RetroArch.
  *  If not, see <http://www.gnu.org/licenses/>.
  */
-#if defined(MIYOOMINI)
-#include "oss_miyoomini.c"
-#else
+
+/*
+      Modified OSS driver exclusively for miyoomini
+      Supports both AudioFix: ON / OFF
+*/
+
+/* To use audioserver, must use open instead of open64 */
+#ifdef _FILE_OFFSET_BITS
+#undef _FILE_OFFSET_BITS
+#define _FILE_OFFSET_BITS 32
+#endif
 
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 #include <fcntl.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
 #include <errno.h>
-
-#ifdef HAVE_OSS_BSD
-#include <soundcard.h>
-#else
 #include <sys/soundcard.h>
-#endif
-
-#include <retro_endianness.h>
+#include <sdkdir/mi_ao.h>
 
 #ifdef HAVE_CONFIG_H
 #include "../../config.h"
@@ -40,16 +43,14 @@
 #include "../audio_driver.h"
 #include "../../verbosity.h"
 
-#ifdef HAVE_OSS_BSD
-#define DEFAULT_OSS_DEV "/dev/audio"
-#else
 #define DEFAULT_OSS_DEV "/dev/dsp"
-#endif
 
 typedef struct oss_audio
 {
    int fd;
    bool is_paused;
+   bool nonblock;
+   bool audioserver;
 } oss_audio_t;
 
 static void *oss_init(const char *device,
@@ -64,29 +65,40 @@ static void *oss_init(const char *device,
    if (!ossaudio)
       return NULL;
 
-   if ((ossaudio->fd = open(oss_device, O_WRONLY)) < 0)
-   {
-      free(ossaudio);
-      perror("open");
-      return NULL;
+   /* Open /dev/dsp with audioserver check */
+   /* Use the fact that padsp replaces open, but not __open */
+   extern int __open(const char *file, int oflag);
+   if ((ossaudio->fd = __open(oss_device, O_WRONLY)) < 0) {
+      if ((ossaudio->fd = open(oss_device, O_WRONLY)) < 0) {
+         free(ossaudio);
+         perror("open");
+         return NULL;
+      }
+      ossaudio->audioserver = true;
+      new_rate = rate;
+      RARCH_LOG("[OSS]: Using audioserver.\n");
+   } else {
+      /* stock oss supports 48k, 32k, 16k, 8k only */
+      if ( rate > 32000 ) new_rate = 48000;
+      else if ( rate > 16000 ) new_rate = 32000;
+      else if ( rate > 8000 ) new_rate = 16000;
+      else new_rate = 8000;
    }
 
-   frags = (latency * rate * 4) / (1000 * (1 << 10));
+   frags = (latency * new_rate * 4) / (1000 * (1 << 10));
    frag  = (frags << 16) | 10;
 
    if (ioctl(ossaudio->fd, SNDCTL_DSP_SETFRAGMENT, &frag) < 0)
       RARCH_WARN("Cannot set fragment sizes. Latency might not be as expected ...\n");
 
    channels = 2;
-   format   = is_little_endian() ? AFMT_S16_LE : AFMT_S16_BE;
+   format   = AFMT_S16_LE;
 
    if (ioctl(ossaudio->fd, SNDCTL_DSP_CHANNELS, &channels) < 0)
       goto error;
 
    if (ioctl(ossaudio->fd, SNDCTL_DSP_SETFMT, &format) < 0)
       goto error;
-
-   new_rate = rate;
 
    if (ioctl(ossaudio->fd, SNDCTL_DSP_SPEED, &new_rate) < 0)
       goto error;
@@ -95,6 +107,17 @@ static void *oss_init(const char *device,
    {
       RARCH_WARN("Requested sample rate not supported. Adjusting output rate to %d Hz.\n", new_rate);
       *new_out_rate = new_rate;
+   }
+
+   if (!ossaudio->audioserver) {
+      /* mi_ao init is required for stock oss */
+      MI_AUDIO_Attr_t attr;
+      memset(&attr, 0, sizeof(attr));
+      attr.eSamplerate = new_rate;
+      attr.eSoundmode = E_MI_AUDIO_SOUND_MODE_STEREO;
+      attr.u32ChnCnt = 2;
+      attr.u32PtNumPerFrm = 256;
+      MI_AO_SetPubAttr(0, &attr);
    }
 
    return ossaudio;
@@ -112,7 +135,8 @@ static ssize_t oss_write(void *data, const void *buf, size_t size)
    ssize_t ret;
    oss_audio_t *ossaudio  = (oss_audio_t*)data;
 
-   if (size == 0)
+   /* For stock oss, no playback during fast forward to avoid blocking */
+   if ( (size == 0) || ((!ossaudio->audioserver)&&(ossaudio->nonblock)) )
       return 0;
 
    if ((ret = write(ossaudio->fd, buf, size)) < 0)
@@ -130,11 +154,6 @@ static bool oss_stop(void *data)
 {
    oss_audio_t *ossaudio  = (oss_audio_t*)data;
 
-#if !defined(RETROFW)
-   if (ioctl(ossaudio->fd, SNDCTL_DSP_RESET, 0) < 0)
-      return false;
-#endif
-
    ossaudio->is_paused = true;
    return true;
 }
@@ -142,8 +161,8 @@ static bool oss_stop(void *data)
 static bool oss_start(void *data, bool is_shutdown)
 {
    oss_audio_t *ossaudio  = (oss_audio_t*)data;
-   if (!ossaudio)
-      return false;
+   if (!ossaudio) return false;
+
    ossaudio->is_paused = false;
    return true;
 }
@@ -156,28 +175,17 @@ static bool oss_alive(void *data)
 
 static void oss_set_nonblock_state(void *data, bool state)
 {
-   int rc;
    oss_audio_t *ossaudio  = (oss_audio_t*)data;
 
-   if (state)
-      rc =  fcntl(ossaudio->fd, F_SETFL,
-            fcntl(ossaudio->fd, F_GETFL) | O_NONBLOCK);
-   else
-      rc =  fcntl(ossaudio->fd, F_SETFL,
-            fcntl(ossaudio->fd, F_GETFL) & (~O_NONBLOCK));
-   if (rc != 0)
-      RARCH_WARN("Could not set nonblocking on OSS file descriptor. Will not be able to fast-forward.\n");
+   if (state) fcntl(ossaudio->fd, F_SETFL, fcntl(ossaudio->fd, F_GETFL) | O_NONBLOCK);
+   else       fcntl(ossaudio->fd, F_SETFL, fcntl(ossaudio->fd, F_GETFL) & (~O_NONBLOCK));
+
+   ossaudio->nonblock = state;
 }
 
 static void oss_free(void *data)
 {
    oss_audio_t *ossaudio  = (oss_audio_t*)data;
-
-/*RETROFW IOCTL always returns EINVAL*/ 
-#if !defined(RETROFW)
-   if (ioctl(ossaudio->fd, SNDCTL_DSP_RESET, 0) < 0)
-      return;
-#endif
 
    close(ossaudio->fd);
    free(data);
@@ -232,4 +240,3 @@ audio_driver_t audio_oss = {
    oss_write_avail,
    oss_buffer_size,
 };
-#endif

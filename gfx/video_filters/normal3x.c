@@ -14,20 +14,16 @@
  *  If not, see <http://www.gnu.org/licenses/>.
  */
 
-/* Compile: gcc -o normal2x.so -shared normal2x.c -std=c99 -O3 -Wall -pedantic -fPIC */
-
-#ifdef MIYOOMINI
-#include "../drivers/miyoomini/scaler_neon.h"
-#endif
+/* Compile: gcc -o normal3x.so -shared normal3x.c -std=c99 -O3 -Wall -pedantic -fPIC */
 
 #include "softfilter.h"
 #include <stdlib.h>
 #include <string.h>
 
 #ifdef RARCH_INTERNAL
-#define softfilter_get_implementation normal2x_get_implementation
-#define softfilter_thread_data normal2x_softfilter_thread_data
-#define filter_data normal2x_filter_data
+#define softfilter_get_implementation normal3x_get_implementation
+#define softfilter_thread_data normal3x_softfilter_thread_data
+#define filter_data normal3x_filter_data
 #endif
 
 struct softfilter_thread_data
@@ -50,23 +46,23 @@ struct filter_data
    unsigned in_fmt;
 };
 
-static unsigned normal2x_generic_input_fmts(void)
+static unsigned normal3x_generic_input_fmts(void)
 {
    return SOFTFILTER_FMT_XRGB8888 | SOFTFILTER_FMT_RGB565;
 }
 
-static unsigned normal2x_generic_output_fmts(unsigned input_fmts)
+static unsigned normal3x_generic_output_fmts(unsigned input_fmts)
 {
    return input_fmts;
 }
 
-static unsigned normal2x_generic_threads(void *data)
+static unsigned normal3x_generic_threads(void *data)
 {
    struct filter_data *filt = (struct filter_data*)data;
    return filt->threads;
 }
 
-static void *normal2x_generic_create(const struct softfilter_config *config,
+static void *normal3x_generic_create(const struct softfilter_config *config,
       unsigned in_fmt, unsigned out_fmt,
       unsigned max_width, unsigned max_height,
       unsigned threads, softfilter_simd_mask_t simd, void *userdata)
@@ -91,15 +87,15 @@ static void *normal2x_generic_create(const struct softfilter_config *config,
    return filt;
 }
 
-static void normal2x_generic_output(void *data,
+static void normal3x_generic_output(void *data,
       unsigned *out_width, unsigned *out_height,
       unsigned width, unsigned height)
 {
-   *out_width = width << 1;
-   *out_height = height << 1;
+   *out_width = width * 3;
+   *out_height = height * 3;
 }
 
-static void normal2x_generic_destroy(void *data)
+static void normal3x_generic_destroy(void *data)
 {
    struct filter_data *filt = (struct filter_data*)data;
    if (!filt) {
@@ -109,87 +105,60 @@ static void normal2x_generic_destroy(void *data)
    free(filt);
 }
 
-static void normal2x_work_cb_xrgb8888(void *data, void *thread_data)
-{
-   struct softfilter_thread_data *thr = (struct softfilter_thread_data*)thread_data;
-#ifdef MIYOOMINI
-   scale2x_n32((void*)thr->in_data, thr->out_data, thr->width, thr->height, thr->in_pitch, thr->out_pitch);
-#else
-   const uint32_t *input              = (const uint32_t*)thr->in_data;
-   uint32_t *output                   = (uint32_t*)thr->out_data;
-   uint32_t in_stride                 = (uint32_t)(thr->in_pitch >> 2);
-   uint32_t out_stride                = (uint32_t)(thr->out_pitch >> 2);
-   uint32_t x, y;
-
-   for (y = 0; y < thr->height; ++y)
-   {
-      uint32_t *out_ptr = output;
-      for (x = 0; x < thr->width; ++x)
-      {
-         uint32_t *out_line_ptr = out_ptr;
-         uint32_t color         = *(input + x);
-         uint32_t row_color[2];
-
-         row_color[0] = color;
-         row_color[1] = color;
-
-         /* Row 1 */
-         memcpy(out_line_ptr, row_color, sizeof(row_color));
-         out_line_ptr += out_stride;
-
-         /* Row 2 */
-         memcpy(out_line_ptr, row_color, sizeof(row_color));
-
-         out_ptr += 2;
-      }
-
-      input  += in_stride;
-      output += out_stride << 1;
-   }
-#endif
+static void scale3x_c16(void* __restrict src, void* __restrict dst, uint32_t sw, uint32_t sh, uint32_t sp, uint32_t dp) {
+	if (!sw||!sh) { return; }
+	uint32_t x, dx, pix, dpix1, dpix2, swl = sw*sizeof(uint16_t);
+	if (!sp) { sp = swl; } swl*=3; if (!dp) { dp = swl; }
+	for (; sh>0; sh--, src=(uint8_t*)src+sp, dst=(uint8_t*)dst+dp*3) {
+		uint32_t *s = (uint32_t* __restrict)src;
+		uint32_t *d = (uint32_t* __restrict)dst;
+		for (x=dx=0; x<(sw/2); x++, dx+=3) {
+			pix = s[x];
+			dpix1=(pix & 0x0000FFFF)|(pix<<16);
+			dpix2=(pix & 0xFFFF0000)|(pix>>16);
+			d[dx] = dpix1; d[dx+1] = pix; d[dx+2] = dpix2;
+		}
+		if (sw&1) {
+			uint16_t *s16 = (uint16_t*)s;
+			uint16_t *d16 = (uint16_t*)d;
+			uint16_t pix16 = s16[x*2];
+			dpix1 = pix16|(pix16<<16);
+			d[dx] = dpix1; d16[(dx+1)*2] = pix16;
+		}
+		memcpy((uint8_t*)dst+dp*1, dst, swl);
+		memcpy((uint8_t*)dst+dp*2, dst, swl);
+	}
 }
 
-static void normal2x_work_cb_rgb565(void *data, void *thread_data)
-{
-   struct softfilter_thread_data *thr = (struct softfilter_thread_data*)thread_data;
-#ifdef MIYOOMINI
-   scale2x_n16((void*)thr->in_data, thr->out_data, thr->width, thr->height, thr->in_pitch, thr->out_pitch);
-#else
-   const uint16_t *input              = (const uint16_t*)thr->in_data;
-   uint16_t *output                   = (uint16_t*)thr->out_data;
-   uint16_t in_stride                 = (uint16_t)(thr->in_pitch >> 1);
-   uint16_t out_stride                = (uint16_t)(thr->out_pitch >> 1);
-   uint16_t x, y;
-
-   for (y = 0; y < thr->height; ++y)
-   {
-      uint16_t *out_ptr = output;
-      for (x = 0; x < thr->width; ++x)
-      {
-         uint16_t *out_line_ptr = out_ptr;
-         uint16_t color         = *(input + x);
-         uint16_t row_color[2];
-
-         row_color[0] = color;
-         row_color[1] = color;
-
-         /* Row 1 */
-         memcpy(out_line_ptr, row_color, sizeof(row_color));
-         out_line_ptr += out_stride;
-
-         /* Row 2 */
-         memcpy(out_line_ptr, row_color, sizeof(row_color));
-
-         out_ptr += 2;
-      }
-
-      input  += in_stride;
-      output += out_stride << 1;
-   }
-#endif
+static void scale3x_c32(void* __restrict src, void* __restrict dst, uint32_t sw, uint32_t sh, uint32_t sp, uint32_t dp) {
+	if (!sw||!sh) { return; }
+	uint32_t x, dx, pix, swl = sw*sizeof(uint32_t);
+	if (!sp) { sp = swl; } swl*=3; if (!dp) { dp = swl; }
+	for (; sh>0; sh--, src=(uint8_t*)src+sp, dst=(uint8_t*)dst+dp*3) {
+		uint32_t *s = (uint32_t* __restrict)src;
+		uint32_t *d = (uint32_t* __restrict)dst;
+		for (x=dx=0; x<sw; x++, dx+=3) {
+			pix = s[x];
+			d[dx] = pix; d[dx+1] = pix; d[dx+2] = pix;
+		}
+		memcpy((uint8_t*)dst+dp*1, dst, swl);
+		memcpy((uint8_t*)dst+dp*2, dst, swl);
+	}
 }
 
-static void normal2x_generic_packets(void *data,
+static void normal3x_work_cb_xrgb8888(void *data, void *thread_data)
+{
+   struct softfilter_thread_data *thr = (struct softfilter_thread_data*)thread_data;
+   scale3x_c32((void*)thr->in_data, thr->out_data, thr->width, thr->height, thr->in_pitch, thr->out_pitch);
+}
+
+static void normal3x_work_cb_rgb565(void *data, void *thread_data)
+{
+   struct softfilter_thread_data *thr = (struct softfilter_thread_data*)thread_data;
+   scale3x_c16((void*)thr->in_data, thr->out_data, thr->width, thr->height, thr->in_pitch, thr->out_pitch);
+}
+
+static void normal3x_generic_packets(void *data,
       struct softfilter_work_packet *packets,
       void *output, size_t output_stride,
       const void *input, unsigned width, unsigned height, size_t input_stride)
@@ -210,34 +179,34 @@ static void normal2x_generic_packets(void *data,
    thr->height = height;
 
    if (filt->in_fmt == SOFTFILTER_FMT_XRGB8888) {
-      packets[0].work = normal2x_work_cb_xrgb8888;
+      packets[0].work = normal3x_work_cb_xrgb8888;
    } else if (filt->in_fmt == SOFTFILTER_FMT_RGB565) {
-      packets[0].work = normal2x_work_cb_rgb565;
+      packets[0].work = normal3x_work_cb_rgb565;
    }
    packets[0].thread_data = thr;
 }
 
-static const struct softfilter_implementation normal2x_generic = {
-   normal2x_generic_input_fmts,
-   normal2x_generic_output_fmts,
+static const struct softfilter_implementation normal3x_generic = {
+   normal3x_generic_input_fmts,
+   normal3x_generic_output_fmts,
 
-   normal2x_generic_create,
-   normal2x_generic_destroy,
+   normal3x_generic_create,
+   normal3x_generic_destroy,
 
-   normal2x_generic_threads,
-   normal2x_generic_output,
-   normal2x_generic_packets,
+   normal3x_generic_threads,
+   normal3x_generic_output,
+   normal3x_generic_packets,
 
    SOFTFILTER_API_VERSION,
-   "Normal2x",
-   "normal2x",
+   "Normal3x",
+   "normal3x",
 };
 
 const struct softfilter_implementation *softfilter_get_implementation(
       softfilter_simd_mask_t simd)
 {
    (void)simd;
-   return &normal2x_generic;
+   return &normal3x_generic;
 }
 
 #ifdef RARCH_INTERNAL
